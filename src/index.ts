@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import express from 'express';
 import { Server } from 'http';
 import { Server as HttpsServer } from 'https';
@@ -6,10 +8,11 @@ import { join } from 'path';
 import socketIO from 'socket.io';
 import Tracer from 'tracer';
 import morgan from 'morgan';
-import crypto from 'crypto';
 import peerConfig from './peerConfig';
 import { ICEServer } from './ICEServer';
-import e from 'express';
+import { PublicLobby } from './interfaces/publicLobby';
+import { GameState } from './interfaces/gameState';
+import { lobbyInfo } from './interfaces/lobbyInfo';
 let TurnServer = require('node-turn');
 
 const httpsEnabled = !!process.env.HTTPS;
@@ -64,11 +67,10 @@ if (peerConfig.integratedRelay.enabled) {
 }
 
 const io = socketIO(server);
-
 const clients = new Map<string, Client>();
 const publicLobbies = new Map<string, PublicLobby>();
 const lobbyCodes = new Map<number, string>();
-const allLobbies = new Map<string, number>();
+const allLobbies = new Map<string, lobbyInfo>();
 let lobbyCount = 0;
 
 function removePublicLobby(c: string) {
@@ -94,34 +96,6 @@ interface ClientPeerConfig {
 	iceServers: ICEServer[];
 }
 
-interface ClientPeerConfig {
-	forceRelayOnly: boolean;
-	iceServers: ICEServer[];
-}
-
-enum GameState {
-	LOBBY,
-	TASKS,
-	DISCUSSION,
-	MENU,
-	UNKNOWN,
-}
-
-interface PublicLobby {
-	id: number;
-	title: string;
-	host: string;
-	current_players: number;
-	max_players: number;
-	language: string;
-	mods: string;
-	isPublic: boolean;
-	isPublic2?: boolean;
-	server: string;
-	gameState: GameState;
-	stateTime: number;
-}
-
 app.enable('trust proxy');
 app.set('views', join(__dirname, '../views'));
 app.use('/public', express.static(join(__dirname, '../public')));
@@ -137,12 +111,12 @@ if (!hostname && peerConfig.integratedRelay.enabled) {
 }
 
 app.get('/', (req, res) => {
-	let address = req.protocol + '://' + req.host;
+	let address = req.protocol + '://' + req.hostname;
 	res.render('index', { connectionCount, address, lobbiesCount: allLobbies.size });
 });
 
 app.get('/health', (req, res) => {
-	let address = req.protocol + '://' + req.host;
+	let address = req.protocol + '://' + req.hostname;
 	res.json({
 		uptime: process.uptime(),
 		connectionCount,
@@ -160,7 +134,7 @@ const leaveroom = (socket: socketIO.Socket, code: string) => {
 	if (!code) {
 		return;
 	}
-	if (code && code.length === 6) socket.leave(code);
+	if (code && (code.length === 6 || code.length === 4)) socket.leave(code);
 
 	if ((io.sockets.adapter.rooms[code]?.length ?? 0) <= 0) {
 		if (allLobbies.has(code)) {
@@ -168,7 +142,6 @@ const leaveroom = (socket: socketIO.Socket, code: string) => {
 		}
 		removePublicLobby(code);
 	}
-	// public room check
 };
 io.on('connection', (socket: socketIO.Socket) => {
 	connectionCount++;
@@ -193,8 +166,12 @@ io.on('connection', (socket: socketIO.Socket) => {
 
 	socket.emit('clientPeerConfig', clientPeerConfig);
 
-	socket.on('join', (c: string, id: number, clientId: number) => {
-		if (typeof c !== 'string' || typeof id !== 'number' || typeof clientId !== 'number') {
+	socket.on('join', (c: string, id: number, clientId: number, isHost?: boolean) => {
+		if (
+			typeof c !== 'string' ||
+			typeof id !== 'number' ||
+			typeof clientId !== 'number' 
+		) {
 			socket.disconnect();
 			logger.error(`Socket %s sent invalid join command: %s %d %d`, socket.id, c, id, clientId);
 			return;
@@ -204,15 +181,19 @@ io.on('connection', (socket: socketIO.Socket) => {
 		if (io.sockets.adapter.rooms[c]) {
 			let socketsInLobby = Object.keys(io.sockets.adapter.rooms[c].sockets);
 			for (let s of socketsInLobby) {
-				// if (clients.has(s) && clients.get(s).clientId === clientId) {
-				// 	socket.disconnect();
-				// 	logger.error(`Socket %s sent invalid join command, attempted spoofing another client`);
-				// 	return;
-				// }
 				if (s !== socket.id) otherClients[s] = clients.get(s);
 			}
-		} else if (!allLobbies.has(c) && c.length === 6) {
-			allLobbies.set(c, 1);
+		}
+
+		if (!allLobbies.has(c)) {
+			allLobbies.set(c, { code: c, hostId: isHost ? clientId : -1, publicLobbyId: -1, connectedCount: 1 });
+		} else {
+			allLobbies.get(c).connectedCount++;
+			if (isHost) {
+				allLobbies.get(c).hostId = clientId;
+				socket.to(code).broadcast.emit('setHost', clientId);
+			}
+			socket.emit('setHost', allLobbies.get(c).hostId);
 		}
 
 		if (code != c) leaveroom(socket, code);
@@ -223,6 +204,15 @@ io.on('connection', (socket: socketIO.Socket) => {
 			clientId: clientId,
 		});
 		socket.emit('setClients', otherClients);
+	});
+
+	socket.on('setHost', (c: string, clientId: number) => {
+		if (code === c) {
+			if (allLobbies.has(c)) {
+				allLobbies.get(c).hostId = clientId;
+				socket.to(code).broadcast.emit('setHost', clientId);
+			}
+		}
 	});
 
 	socket.on('id', (id: number, clientId: number) => {
@@ -280,30 +270,34 @@ io.on('connection', (socket: socketIO.Socket) => {
 		callbackFn(1, 'Lobby not found :C');
 	});
 
-	socket.on('lobby', (c: string, lobbyInfo: PublicLobby) => {
+	socket.on('lobby', (c: string, publicLobby: PublicLobby) => {
 		if (code != c) {
 			logger.error(`Got request to host lobby while not in it %s`, c, code);
 			return;
 		}
-		if (!lobbyInfo.isPublic && !lobbyInfo.isPublic2) {
+		if (!publicLobby.isPublic && !publicLobby.isPublic2) {
 			removePublicLobby(c);
 		} else {
 			const publobby = publicLobbies.has(c) ? publicLobbies.get(c) : undefined;
 			const id = publobby ? publobby.id : lobbyCount++;
-			const stateTime = publobby && ((publobby.gameState === GameState.LOBBY && lobbyInfo.gameState === GameState.LOBBY) ||
-				(publobby.gameState !== GameState.LOBBY && lobbyInfo.gameState !== GameState.LOBBY)) ? publobby.stateTime : Date.now();
+			const stateTime =
+				publobby &&
+				((publobby.gameState === GameState.LOBBY && publicLobby.gameState === GameState.LOBBY) ||
+					(publobby.gameState !== GameState.LOBBY && publicLobby.gameState !== GameState.LOBBY))
+					? publobby.stateTime
+					: Date.now();
 			let lobby: PublicLobby = {
 				id,
-				title: lobbyInfo.title?.substring(0, 20) ?? 'ERROR',
-				host: lobbyInfo.host?.substring(0, 10) ?? '',
-				current_players: lobbyInfo.current_players ?? 0,
-				max_players: lobbyInfo.max_players ?? 0,
-				language: lobbyInfo.language?.substring(0, 5) ?? '',
-				mods: lobbyInfo.mods?.substring(0, 20)?.toUpperCase() ?? '',
-				isPublic: lobbyInfo.isPublic || lobbyInfo.isPublic2,
-				server: lobbyInfo.server,
-				gameState: lobbyInfo.gameState,
-				stateTime
+				title: publicLobby.title?.substring(0, 20) ?? 'ERROR',
+				host: publicLobby.host?.substring(0, 10) ?? '',
+				current_players: publicLobby.current_players ?? 0,
+				max_players: publicLobby.max_players ?? 0,
+				language: publicLobby.language?.substring(0, 5) ?? '',
+				mods: publicLobby.mods?.substring(0, 20)?.toUpperCase() ?? '',
+				isPublic: publicLobby.isPublic || publicLobby.isPublic2,
+				server: publicLobby.server,
+				gameState: publicLobby.gameState,
+				stateTime,
 			};
 			lobbyCodes.set(id, c);
 			publicLobbies.set(c, lobby);
